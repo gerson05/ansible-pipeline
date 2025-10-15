@@ -2,6 +2,10 @@
 - name: Instalar y configurar Nginx
   hosts: nginx
   become: true
+  gather_facts: true
+  vars_files:
+    - vars/main.yml
+
   tasks:
     - name: Actualizar cache de paquetes
       apt:
@@ -12,11 +16,28 @@
         name: nginx
         state: present
 
-    - name: Iniciar servicio Nginx
-      systemd:
-        name: nginx
-        state: started
-        enabled: yes
+    - name: Crear directorio para configuración personalizada
+      file:
+        path: /etc/nginx/conf.d
+        state: directory
+        mode: '0755'
+
+    - name: Copiar configuración base de Nginx desde plantilla
+      template:
+        src: templates/nginx-base.conf.j2
+        dest: /etc/nginx/nginx.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart nginx
+
+    - name: Copiar aplicación web desde control (rsync)
+      become: false
+      synchronize:
+        src: "{{ playbook_dir }}/../Teclado/"
+        dest: /var/www/html/
+        recursive: yes
+      delegate_to: localhost
 
     - name: Cambiar propietario de /var/www/html
       file:
@@ -25,92 +46,183 @@
         group: "{{ ansible_user }}"
         recurse: yes
 
-- name: Instalación de Docker y Docker Compose en Ubuntu
+    - name: Iniciar y habilitar servicio Nginx
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Mostrar información de Nginx y rutas
+      debug:
+        msg:
+          - "==================================================="
+          - "Nginx Proxy configurado exitosamente!"
+          - "IP del Proxy: {{ ansible_host }}"
+          - "Nginx está apuntando a:"
+          - "  - Jenkins: {{ jenkins_host | default(ansible_host) }}:{{ jenkins_port | default('8080') }}"
+          - "  - SonarQube: {{ sonar_host | default(ansible_host) }}:{{ sonar_port | default('9000') }}"
+          - ""
+          - "Accesos (por proxy):"
+          - "  - http://{{ ansible_host }}/jenkins/"
+          - "  - http://{{ ansible_host }}/sonar/"
+          - "==================================================="
+
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+- name: Instalación de Docker y despliegue de stack (Jenkins, SonarQube, Postgres)
   hosts: jenkins
   become: true
-  
+  gather_facts: true
+  vars_files:
+    - vars/main.yml
+
   tasks:
-    # Actualizar el cache de paquetes
     - name: Actualizar el cache de paquetes
       apt:
         update_cache: yes
 
-    # Instalar dependencias para Docker
     - name: Instalar dependencias para Docker
       apt:
-        name: 
+        name:
           - apt-transport-https
           - ca-certificates
           - curl
           - gnupg-agent
           - software-properties-common
+        state: present
 
-    # Agregar la clave GPG oficial de Docker
     - name: Agregar la clave GPG oficial de Docker
       apt_key:
         url: https://download.docker.com/linux/ubuntu/gpg
         state: present
 
-    # Agregar el repositorio de Docker al sources.list.d
     - name: Agregar el repositorio de Docker al sources.list.d
       apt_repository:
-        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
         state: present
 
-    # Actualizar el cache de paquetes de nuevo (para que encuentre el paquete de Docker)
-    - name: Actualizar el cache de paquetes de nuevo (para que encuentre el paquete de Docker)
+    - name: Actualizar cache de paquetes (tras añadir repo)
       apt:
         update_cache: yes
 
-    # Instalar Docker
     - name: Instalar Docker
       apt:
         name: docker-ce
         state: present
 
-    # Añadir el usuario actual al grupo de Docker
-    - name: Añadir el usuario actual al grupo de Docker
+    - name: Añadir el usuario al grupo docker
       user:
         name: "{{ ansible_user }}"
         groups: docker
         append: yes
 
-    # Instalar Docker Compose
-    - name: Instalar Docker Compose
+    - name: Instalar Docker Compose (si no existe)
       shell: |
         curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
         chmod +x /usr/local/bin/docker-compose
       args:
         creates: /usr/local/bin/docker-compose
-    
+
     - name: Establecer vm.max_map_count en el kernel
       sysctl:
         name: vm.max_map_count
         value: "262144"
         state: present
         reload: yes
-    
-    - name: Copiar archivo de configuración de Nginx
+
+    - name: Copiar Dockerfile de Jenkins al host remoto
+      copy:
+        src: Dockerfile.jenkins
+        dest: /home/{{ ansible_user }}/Dockerfile.jenkins
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+    - name: Copiar lista de plugins de Jenkins
+      copy:
+        src: plugins.txt
+        dest: /home/{{ ansible_user }}/plugins.txt
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+    - name: Copiar docker-compose.yml al host remoto
       copy:
         src: docker-compose.yml
         dest: /home/{{ ansible_user }}/docker-compose.yml
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
 
-    # Ejecutar un archivo docker-compose.yml
-    - name: Ejecutar docker-compose.yml
+    - name: Detener stack previo si existe
+      command: docker-compose down
+      args:
+        chdir: /home/{{ ansible_user }}/
+      ignore_errors: true
+      become: true
+      become_user: root
+
+    - name: Construir imagen personalizada de Jenkins (si hay Dockerfile)
+      command: docker-compose build jenkins
+      args:
+        chdir: /home/{{ ansible_user }}/
+      become: true
+      become_user: root
+
+    - name: Levantar stack con docker-compose
       command: docker-compose up -d
       args:
         chdir: /home/{{ ansible_user }}/
-      become_user: "{{ ansible_user }}"
-      become_method: su
+      become: true
+      become_user: root
 
-    - name: Instalar plugins jenkins
-      command: docker exec -it jenkins jenkins-plugin-cli --plugin-file /plugins.txt
-      become_user: "{{ ansible_user }}"
-      become_method: su
-      notify: restart jenkins
+    - name: Instalar plugins de Jenkins dentro del contenedor
+      command: bash -c "docker exec -i jenkins jenkins-plugin-cli --plugin-file - < /home/{{ ansible_user }}/plugins.txt"
+      register: plugins_install
+      failed_when: plugins_install.rc not in [0,1]
+      changed_when: "'Installed' in plugins_install.stdout or 'Downloaded' in plugins_install.stdout"
+      ignore_errors: true
+
+    - name: Esperar a que Jenkins esté disponible (puerto host)
+      wait_for:
+        host: localhost
+        port: "{{ jenkins_port | default(80) }}"
+        delay: 10
+        timeout: 300
+
+    - name: Esperar a que SonarQube esté disponible (puerto host)
+      wait_for:
+        host: localhost
+        port: "{{ sonar_port | default(9000) }}"
+        delay: 10
+        timeout: 300
+
+    - name: Mostrar información de acceso del stack
+      debug:
+        msg:
+          - "==================================================="
+          - "Stack desplegado exitosamente!"
+          - "Jenkins y SonarQube corriendo en: {{ ansible_host }}"
+          - "Accede a través del proxy Nginx en:"
+          - "  - http://{{ nginx_host | default(ansible_host) }}/jenkins/ (Jenkins por proxy)"
+          - "  - http://{{ nginx_host | default(ansible_host) }}/sonar/ (SonarQube por proxy)"
+          - ""
+          - "Acceso directo (host remoto):"
+          - "  - http://{{ ansible_host }}:{{ jenkins_port | default('80') }}/ (Jenkins)"
+          - "  - http://{{ ansible_host }}:{{ sonar_port | default('9000') }}/sonar/ (SonarQube)"
+          - "==================================================="
 
   handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted
+
     - name: restart jenkins
-      command: sudo docker restart jenkins
-      become_user: "{{ ansible_user }}"
-      become_method: su
+      command: docker restart jenkins
+      become: true
+      become_user: root

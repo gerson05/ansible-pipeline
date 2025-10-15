@@ -1,0 +1,6 @@
+ansible_user: adminuser
+jenkins_port: 80
+sonar_port: 9000
+nginx_host: 20.168.193.87
+jenkins_host: "{{ ansible_host }}"
+sonar_host: "{{ ansible_host }}"

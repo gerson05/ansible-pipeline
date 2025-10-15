@@ -1,0 +1,86 @@
+FROM jenkins/jenkins:lts-jdk17
+
+# Construcción no interactiva
+ENV DEBIAN_FRONTEND=noninteractive
+
+USER root
+
+# Instalar utilidades básicas y preparar repositorios
+RUN set -eux; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends \
+		apt-transport-https \
+		ca-certificates \
+		curl \
+		gnupg \
+		lsb-release \
+		unzip \
+		gnupg2 \
+		dirmngr \
+		software-properties-common \
+		jq \
+	; \
+	rm -rf /var/lib/apt/lists/*;
+
+# Instalar Docker CLI (solo cliente) - añade el repositorio oficial de Docker
+RUN set -eux; \
+	curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg; \
+	echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends docker-ce-cli; \
+	rm -rf /var/lib/apt/lists/*;
+
+# Instalar Node.js (requerido por SonarQube Scanner y builds front-end)
+ENV NODE_VERSION=20.x
+RUN set -eux; \
+	curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION} | bash -; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends nodejs; \
+	npm install -g npm@latest; \
+	node --version; npm --version; \
+	rm -rf /var/lib/apt/lists/*;
+
+# Herramientas para despliegues y utilidades de desarrollo
+RUN set -eux; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends \
+		sshpass \
+		openssh-client \
+		rsync \
+		git \
+		curl \
+	; \
+	rm -rf /var/lib/apt/lists/*;
+
+# Instalar SonarQube Scanner
+ENV SONAR_SCANNER_VERSION=5.0.1.3006
+RUN set -eux; \
+	curl -o /tmp/sonar-scanner.zip -L https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}-linux.zip; \
+	unzip /tmp/sonar-scanner.zip -d /opt; \
+	mv /opt/sonar-scanner-${SONAR_SCANNER_VERSION}-linux /opt/sonar-scanner; \
+	ln -s /opt/sonar-scanner/bin/sonar-scanner /usr/local/bin/sonar-scanner; \
+	chmod +x /opt/sonar-scanner/bin/sonar-scanner; \
+	rm /tmp/sonar-scanner.zip; \
+	rm -rf /var/lib/apt/lists/*;
+
+ENV SONAR_SCANNER_HOME=/opt/sonar-scanner
+ENV PATH="${SONAR_SCANNER_HOME}/bin:${PATH}"
+ENV SONAR_SCANNER_OPTS="-Xmx512m --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED"
+
+# Copiar plugins.txt al contexto de inicialización y usar jenkins-plugin-cli durante la build
+COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
+RUN set -eux; \
+	jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt --verbose || true
+
+# Exponer puertos estándar de Jenkins
+EXPOSE 8080 50000
+
+# Healthcheck simple: verifica que la interfaz web responda
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 CMD curl -fsS --max-time 5 http://localhost:8080/login || exit 1
+
+# Volver al usuario jenkins por seguridad
+USER jenkins
+
+# Desactivar el asistente de configuración inicial
+ENV JAVA_OPTS="-Djenkins.install.runSetupWizard=false"
+
